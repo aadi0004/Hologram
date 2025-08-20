@@ -3,133 +3,114 @@ import mediapipe as mp
 import numpy as np
 import moderngl
 import moderngl_window as mglw
-from pyrr import Matrix44, Vector3
+from mediapipe.python.solutions.face_mesh_connections import FACEMESH_TESSELATION
 
-# ---------- Step 1: Capture face landmarks ----------
+mp_face_mesh = mp.solutions.face_mesh
+
+# Global storage for face points
+FACE_POINTS = None
+
+
 def capture_face_mesh():
     cap = cv2.VideoCapture(0)
-    mp_face = mp.solutions.face_mesh.FaceMesh(
+    print("Position your face. Press SPACE to capture, Q to quit.")
+    face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
         max_num_faces=1,
         refine_landmarks=True,
-        min_detection_confidence=0.5
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
     )
 
-    print("Press [SPACE] to capture your face, [Q] to quit...")
-
-    mesh_points = None
-    while True:
+    pts = None
+    while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = mp_face.process(rgb)
-
-        # Draw landmarks
-        if results.multi_face_landmarks:
-            for lm in results.multi_face_landmarks[0].landmark:
-                h, w, _ = frame.shape
-                x, y = int(lm.x * w), int(lm.y * h)
-                cv2.circle(frame, (x, y), 1, (0, 255, 0), -1)
-
         cv2.imshow("Capture Face", frame)
         key = cv2.waitKey(1) & 0xFF
 
-        if key == ord(' '):  # SPACE = capture
+        if key == ord(" "):
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb)
             if results.multi_face_landmarks:
-                mesh_points = np.array([
-                    [lm.x - 0.5, -(lm.y - 0.5), lm.z]  # shift center, flip Y
-                    for lm in results.multi_face_landmarks[0].landmark
-                ])
-                print("✅ Face captured! Closing camera...")
-                break
-        elif key == ord('q'):
+                pts = []
+                face = results.multi_face_landmarks[0]
+                for lm in face.landmark:
+                    x = (lm.x - 0.5) * 2.0   # scale up
+                    y = -(lm.y - 0.5) * 2.0
+                    z = lm.z * 0.8
+                    pts.append([x, y, z])
+                print(f"[✅] Captured {len(pts)} landmarks")
+            break
+        elif key == ord("q"):
             break
 
     cap.release()
     cv2.destroyAllWindows()
-    return mesh_points
+    return np.array(pts, dtype=np.float32) if pts is not None else None
 
-# ---------- Step 2: Hologram renderer ----------
-class HoloFaceApp(mglw.WindowConfig):
+
+class App(mglw.WindowConfig):
     gl_version = (3, 3)
-    title = "Hologram Face"
-    resource_dir = '.'
-    window_size = (900, 700)
-    aspect_ratio = window_size[0] / window_size[1]
-    vsync = True
-    samples = 4
+    title = "User Hologram"
+    window_size = (800, 800)
+    aspect_ratio = None
+    resizable = True
 
-    def __init__(self, mesh_points, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.ctx.enable(moderngl.DEPTH_TEST)
-        self.ctx.enable(moderngl.BLEND)
-        self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE
 
-        # Load shaders
-        with open('shaders/hologram.vert') as f:
-            vs_src = f.read()
-        with open('shaders/hologram.frag') as f:
-            fs_src = f.read()
-        self.prog = self.ctx.program(vertex_shader=vs_src, fragment_shader=fs_src)
+        global FACE_POINTS
+        pts = FACE_POINTS
+        if pts is None:
+            raise RuntimeError("No face points loaded!")
 
-        # Fake normals
-        normals = np.tile([0, 0, 1], (len(mesh_points), 1))
-        vbo_pos = self.ctx.buffer(mesh_points.astype('f4').tobytes())
-        vbo_nrm = self.ctx.buffer(normals.astype('f4').tobytes())
+        self.prog = self.load_program(
+            vertex_shader="shaders/hologram.vert",
+            fragment_shader="shaders/hologram.frag"
+        )
 
-        self.vao = self.ctx.vertex_array(self.prog, [
-            (vbo_pos, '3f', 'in_position'),
-            (vbo_nrm, '3f', 'in_normal'),
-        ])
+        # VBO
+        self.vbo = self.ctx.buffer(pts.astype("f4").tobytes())
 
-        # Camera setup
-        self.zoom = 2.5
-        self.theta = 0.0
-        self.time_accum = 0.0
+        # Index buffer for lines
+        indices = []
+        for a, b in FACEMESH_TESSELATION:
+            indices += [a, b]
+        self.ibo = self.ctx.buffer(np.array(indices, dtype=np.int32).tobytes())
 
-        # Shader uniforms
-        self.prog['HoloColor'].value = (0.2, 0.9, 1.0)  # cyan glow
-        self.prog['Alpha'].value = 0.8
-        self.prog['ScanFreq'].value = 60.0
-        self.prog['FlickerSpeed'].value = 3.5
-        self.prog['FresnelPower'].value = 2.5
+        self.vao_points = self.ctx.simple_vertex_array(self.prog, self.vbo, "in_position")
+        self.vao_lines = self.ctx.vertex_array(self.prog, [(self.vbo, "3f", "in_position")], self.ibo)
 
-    def on_render(self, time: float, frame_time: float):
-        self.time_accum = time
-        self.ctx.clear(0.02, 0.02, 0.04)
+        if "HoloColor" in self.prog:
+            self.prog["HoloColor"].value = (0.0, 1.0, 1.0)
+        if "Alpha" in self.prog:
+            self.prog["Alpha"].value = 0.9
 
-        # Rotate slowly
-        self.theta += frame_time * 0.4
-        rot = Matrix44.from_y_rotation(self.theta, dtype='f4')
-        model = rot
+        self.ctx.point_size = 5.0
 
-        proj = Matrix44.perspective_projection(45.0, self.aspect_ratio, 0.05, 100.0, dtype='f4')
-        view = Matrix44.look_at((0.0, 0.0, self.zoom), (0.0, 0.0, 0.0), (0.0, 1.0, 0.0), dtype='f4')
-        mvp = proj * view * model
+    def render(self, time, frame_time):
+        self.ctx.clear(0.0, 0.0, 0.05)
+        mvp = np.eye(4, dtype="f4")
+        if "Mvp" in self.prog:
+            self.prog["Mvp"].write(mvp.tobytes())
 
-        # Update uniforms
-        self.prog['Mvp'].write(mvp.astype('f4').tobytes())
-        self.prog['Model'].write(model.astype('f4').tobytes())
-        self.prog['CamPos'].value = (0.0, 0.0, self.zoom)
-        self.prog['Time'].value = self.time_accum
+        self.vao_points.render(moderngl.POINTS)
+        self.vao_lines.render(moderngl.LINES)
 
-        # Render as glowing points
-        self.vao.render(moderngl.POINTS)
 
-# ---------- Step 3: Run ----------
+def main():
+    print("[Main] Starting...")
+    global FACE_POINTS
+    FACE_POINTS = capture_face_mesh()
+    if FACE_POINTS is None:
+        print("[❌] No face captured")
+        return
+
+    print("[App] Launching hologram window...")
+    mglw.run_window_config(App)
+
+
 if __name__ == "__main__":
-    points = capture_face_mesh()
-    if points is not None:
-        print("Launching hologram window...")
-
-        # Create a subclass that injects mesh_points
-        class App(HoloFaceApp):
-            def __init__(self, **kwargs):
-                super().__init__(points, **kwargs)
-
-        mglw.run_window_config(App)
-
-    else:
-        print("❌ No face captured.")
-
+    main()
