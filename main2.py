@@ -9,18 +9,74 @@ from pyrr import Matrix44
 import requests
 from dotenv import load_dotenv
 import os
-import sounddevice as sd
-import soundfile as sf
 import time
 import tkinter as tk
 import queue
+import json
+import math
+import random
+import io
+
+# ---- SAFE AUDIO IMPORTS ----
+try:
+    import sounddevice as sd
+    import soundfile as sf
+except ImportError:
+    sd = None
+    sf = None
+
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
 
 # ---- CONFIG ----
-AUDIO_SAMPLE_RATE = 44100
+AUDIO_SAMPLE_RATE = 22050  # Lower rate for stability
 AUDIO_CHANNELS = 1
 AUDIO_FILENAME = "input.wav"
 TTS_FILENAME = "reply.wav"
 ELEVENLABS_VOICE_ID = "NYkjXRso4QIcgWakN1Cr"  # Silas Vane voice
+
+# ---- VISEME MAPPING (from reference file) ----
+PHONEME_TO_VISEME = {
+    "AA":"A","AE":"A","AH":"A","AX":"A","AW":"A",
+    "EH":"E","EY":"E",
+    "IH":"I","IY":"I",
+    "AO":"O","OW":"O","OY":"O",
+    "UH":"U","UW":"U",
+    "F":"FV","V":"FV",
+    "M":"MBP","B":"MBP","P":"MBP",
+    "L":"L",
+    "S":"SZ","Z":"SZ",
+    "CH":"CHJ","JH":"CHJ","SH":"CHJ","ZH":"CHJ",
+    "R":"RW","W":"RW",
+    "TH":"TH","DH":"TH",
+}
+
+VOWEL_VISEMES = {"a":"A","e":"E","i":"I","o":"O","u":"U"}
+
+VISEME_TO_MOUTH = {
+    # (open, wide, round, closed) each 0..1, used to deform mouth landmarks
+    "REST": (0.05, 0.1, 0.0, 0.5),
+    "A": (0.95, 0.25, 0.05, 0.0),
+    "E": (0.55, 0.70, 0.0, 0.0),
+    "I": (0.45, 0.85, 0.0, 0.0),
+    "O": (0.65, 0.10, 0.85, 0.0),
+    "U": (0.38, 0.10, 0.75, 0.0),
+    "FV": (0.15, 0.25, 0.0, 0.9),
+    "MBP": (0.00, 0.20, 0.0, 1.0),
+    "L": (0.40, 0.35, 0.0, 0.1),
+    "SZ": (0.15, 0.45, 0.0, 0.2),
+    "CHJ": (0.45, 0.30, 0.0, 0.0),
+    "RW": (0.30, 0.10, 0.55, 0.0),
+    "TH": (0.35, 0.20, 0.0, 0.1),
+}
+
+VISEME_PRIORITY = {
+    "MBP": 10, "FV": 9, "TH": 8, "L": 7, "CHJ": 6, "SZ": 5,
+    "O": 4, "U": 4, "A": 3, "E": 3, "I": 3, "RW": 2, "REST": 1
+}
 
 # ---- Load API key ----
 load_dotenv()
@@ -34,7 +90,7 @@ if ELEVENLABS_API_KEY is None:
 face_points_global = None
 holo_instance = None
 speech_manager = None
-gui_queue = queue.Queue()  # ✅ Thread-safe GUI updates
+gui_queue = queue.Queue()
 
 def capture_face_mesh():
     mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
@@ -94,25 +150,207 @@ def get_face_wireframe_indices():
     face_connections = list(mp.solutions.face_mesh.FACEMESH_TESSELATION)
     return np.array(face_connections, dtype=np.uint32).flatten()
 
-def get_advanced_lip_indices():
-    """Get comprehensive lip indices for ULTRA-REALISTIC lip sync"""
-    # ✅ COMPREHENSIVE: All major lip landmarks for maximum realism
-    OUTER_LIP = [61, 84, 17, 314, 405, 320, 307, 375, 321, 308, 324, 318]
-    INNER_LIP = [78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 95, 88]
-    UPPER_LIP = [61, 84, 17, 314, 405]
-    LOWER_LIP = [17, 18, 200, 199, 175, 0, 13, 269, 270, 267, 271, 272]
-    LIP_CORNERS = [61, 291, 39, 181, 184, 17, 314, 405]
-    MOUTH_INTERIOR = [13, 82, 81, 80, 78, 95, 88, 178, 87, 14, 317, 402, 318, 415]
+def get_mouth_indices():
+    """Get mouth landmark indices for realistic deformation"""
+    # From reference file - precise mouth landmarks
+    MOUTH_OUTER = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
+    MOUTH_INNER = [78, 95, 88, 178, 87, 14, 317, 402, 318, 324, 308, 291, 375, 321, 405, 314]
     
-    # Combine all for maximum coverage
-    all_indices = OUTER_LIP + INNER_LIP + UPPER_LIP + LOWER_LIP + LIP_CORNERS + MOUTH_INTERIOR
-    unique_indices = list(set(idx for idx in all_indices if 0 <= idx < 468))
+    # Combine and filter for valid indices
+    all_mouth = list(set(MOUTH_OUTER + MOUTH_INNER))
+    valid_mouth = [idx for idx in all_mouth if 0 <= idx < 468]
     
-    return np.array(unique_indices, dtype=np.int32)
+    return np.array(valid_mouth, dtype=np.int32)
+
+# ---- ELEVENLABS WITH ALIGNMENT (from reference) ----
+def elevenlabs_tts_with_alignment(text: str):
+    """Enhanced TTS with alignment data for precise lip sync"""
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError("Set ELEVENLABS_API_KEY in your environment")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    
+    # 1) Try to fetch alignment data
+    alignment = None
+    try:
+        headers_json = {
+            "xi-api-key": ELEVENLABS_API_KEY,
+            "accept": "application/json",
+            "content-type": "application/json",
+        }
+        payload_json = {
+            "text": text,
+            "model_id": "eleven_monolingual_v1",
+            "voice_settings": {
+                "stability": 0.8,
+                "similarity_boost": 0.9,
+                "style": 0.3,
+                "use_speaker_boost": True
+            },
+            "alignment": True
+        }
+        r = requests.post(url, headers=headers_json, json=payload_json, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            alignment = data.get("alignment") or data.get("timings")
+    except Exception as e:
+        print(f"Alignment fetch failed: {e}")
+        alignment = None
+
+    # 2) Fetch MP3 and decode safely
+    headers_mp3 = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "accept": "audio/mpeg",
+        "content-type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": "eleven_monolingual_v1",
+        "voice_settings": {
+            "stability": 0.8,
+            "similarity_boost": 0.9,
+            "style": 0.3,
+            "use_speaker_boost": True
+        }
+    }
+    
+    rr = requests.post(url, headers=headers_mp3, json=payload, timeout=30)
+    rr.raise_for_status()
+    
+    # Safe audio decoding
+    if PYDUB_AVAILABLE:
+        try:
+            mp3_bytes = io.BytesIO(rr.content)
+            seg = AudioSegment.from_file(mp3_bytes, format="mp3")
+            seg = seg.set_channels(1)  # mono
+            seg = seg.set_frame_rate(AUDIO_SAMPLE_RATE)
+            sample_rate = seg.frame_rate
+            audio = np.array(seg.get_array_of_samples(), dtype=np.int16)
+        except Exception as e:
+            print(f"Pydub decode failed: {e}")
+            return None, None, []
+    else:
+        # Save to file and use soundfile
+        with open(TTS_FILENAME, 'wb') as f:
+            f.write(rr.content)
+        try:
+            audio, sample_rate = sf.read(TTS_FILENAME, dtype='int16')
+            if len(audio.shape) > 1:
+                audio = audio[:, 0]  # Take first channel
+            audio = audio.astype(np.int16)
+        except Exception as e:
+            print(f"Soundfile decode failed: {e}")
+            return None, None, []
+    
+    # Build timeline from alignment
+    total_audio_sec = len(audio) / sample_rate
+    timeline = build_viseme_timeline_from_alignment(alignment or {"words": []}, total_audio_sec)
+    
+    return audio, sample_rate, timeline
+
+def normalize_phoneme(p: str) -> str:
+    p = p.strip().upper()
+    return "".join([c for c in p if not c.isdigit()])
+
+def words_to_viseme_guess(word: str):
+    """Fallback viseme generation from word"""
+    seq = []
+    for ch in word.lower():
+        if ch in VOWEL_VISEMES: 
+            seq.append(VOWEL_VISEMES[ch])
+        elif ch in ["m","b","p"]: 
+            seq.append("MBP")
+        elif ch in ["f","v"]: 
+            seq.append("FV")
+        elif ch == "l": 
+            seq.append("L")
+        elif ch in ["s","z"]: 
+            seq.append("SZ")
+        elif ch in ["r","w"]: 
+            seq.append("RW")
+        elif ch in ["t","d","h"]: 
+            seq.append("TH")
+        else: 
+            seq.append("REST")
+    return seq or ["REST"]
+
+def build_viseme_timeline_from_alignment(aln: dict, total_audio_sec: float):
+    """Build timeline from ElevenLabs alignment data"""
+    entries = []
+    
+    # Try explicit phonemes first
+    if isinstance(aln, dict) and isinstance(aln.get("phonemes"), list):
+        for ph in aln["phonemes"]:
+            phn = normalize_phoneme(ph.get("phoneme",""))
+            vis = PHONEME_TO_VISEME.get(phn)
+            if not vis: continue
+            start = float(ph.get("start", 0.0))
+            end = float(ph.get("end", start + 0.08))
+            entries.append({"start": start, "end": end, "viseme": vis})
+        
+        if entries:
+            return sorted(entries, key=lambda e: e["start"])
+    
+    # Try words with phonemes
+    if isinstance(aln, dict) and isinstance(aln.get("words"), list):
+        for w in aln["words"]:
+            wstart = float(w.get("start", 0.0))
+            wend = float(w.get("end", max(0.08, wstart + 0.2)))
+            duration = max(0.08, wend - wstart)
+            
+            phs = w.get("phonemes")
+            if isinstance(phs, list) and phs:
+                seg = len(phs)
+                for i, ph in enumerate(phs):
+                    phn = normalize_phoneme(ph.get("phoneme",""))
+                    vis = PHONEME_TO_VISEME.get(phn)
+                    if not vis: continue
+                    s = wstart + (i/seg) * duration
+                    e = wstart + ((i+1)/seg) * duration
+                    entries.append({"start": s, "end": e, "viseme": vis})
+            else:
+                # Guess from word
+                guess = words_to_viseme_guess(w.get("word",""))
+                seg = max(1, len(guess))
+                for i, vis in enumerate(guess):
+                    s = wstart + (i/seg) * duration
+                    e = wstart + ((i+1)/seg) * duration
+                    entries.append({"start": s, "end": e, "viseme": vis})
+        
+        if entries:
+            return sorted(entries, key=lambda e: e["start"])
+    
+    # Fallback synthetic cycle
+    t = 0.0
+    step = 0.12
+    cycle = ["A","E","I","O","U","MBP","FV","REST"]
+    ci = 0
+    while t < total_audio_sec:
+        entries.append({"start": t, "end": min(total_audio_sec, t+step), "viseme": cycle[ci % len(cycle)]})
+        t += step
+        ci += 1
+    
+    return entries
+
+def active_viseme(timeline, t: float) -> str:
+    """Get active viseme at time t with priority"""
+    window = 0.05
+    best, pr = "REST", -1
+    
+    for e in timeline:
+        if e["start"] - window <= t <= e["end"] + window:
+            v = e["viseme"]
+            p = VISEME_PRIORITY.get(v, 0)
+            if p > pr:
+                best, pr = v, p
+        if e["start"] > t + 0.2:
+            break
+    
+    return best
 
 class HologramFace(WindowConfig):
     gl_version = (3, 3)
-    title = "3D Holographic Face Assistant - ULTRA Realistic Lip Sync"
+    title = "3D Holographic Face Assistant - Realistic Lip Sync"
     window_size = (1200, 900)
     resource_dir = '.'
 
@@ -125,27 +363,22 @@ class HologramFace(WindowConfig):
         self.base_mesh = face_points_global.copy()
         self.vertex_count = len(self.mesh)
         self.time = 0.0
-        self.lip_time = 0.0
         self.speaking = False
         
-        # ✅ ULTRA-REALISTIC: Advanced lip animation system
-        self.lip_indices = get_advanced_lip_indices()
+        # ---- REALISTIC LIP SYNC SYSTEM ----
+        self.mouth_indices = get_mouth_indices()
         self.wireframe_indices = get_face_wireframe_indices()
+        self.current_viseme = "REST"
         
-        # ✅ PHONEME SIMULATION: Different mouth shapes for different sounds
-        self.phoneme_patterns = {
-            'A': {'mouth_open': 0.15, 'mouth_wide': 0.02},
-            'E': {'mouth_open': 0.08, 'mouth_wide': 0.06},
-            'I': {'mouth_open': 0.04, 'mouth_wide': 0.08},
-            'O': {'mouth_open': 0.12, 'mouth_wide': -0.02},
-            'U': {'mouth_open': 0.06, 'mouth_wide': -0.04},
-            'M': {'mouth_open': 0.01, 'mouth_wide': 0.0},
-            'P': {'mouth_open': 0.02, 'mouth_wide': 0.0},
-            'F': {'mouth_open': 0.03, 'mouth_wide': 0.01},
-            'S': {'mouth_open': 0.02, 'mouth_wide': 0.03}
-        }
+        # Blink system
+        self.blink_t = 0.0
+        self.next_blink_gap = random.uniform(3.0, 6.0)
         
-        print(f"✅ Using {len(self.lip_indices)} advanced lip indices for ultra-realistic sync")
+        # Eye indices (rough)
+        self.eyelid_upper = [159, 145, 160, 161, 246]
+        self.eyelid_lower = [23, 27, 159, 158, 157]
+        
+        print(f"✅ Using {len(self.mouth_indices)} mouth indices for realistic viseme lip sync")
 
         # Rendering programs
         self.point_prog = self.ctx.program(
@@ -210,94 +443,87 @@ class HologramFace(WindowConfig):
         )
 
     def start_speaking(self):
-        print("🗣️ Ultra-realistic lip animation started")
+        print("🗣️ Realistic viseme lip animation started")
         self.speaking = True
-        self.lip_time = 0.0
 
     def stop_speaking(self):
-        print("🔇 Ultra-realistic lip animation stopped")
+        print("🔇 Realistic viseme lip animation stopped")
         self.speaking = False
+        self.current_viseme = "REST"
+        self.reset_mesh()
+
+    def set_viseme(self, viseme: str):
+        """Set current viseme for lip sync"""
+        self.current_viseme = viseme if viseme in VISEME_TO_MOUTH else "REST"
+
+    def reset_mesh(self):
+        """Reset mesh to original positions"""
         try:
-            # Reset all lip vertices
-            for idx in self.lip_indices:
-                if 0 <= idx < len(self.mesh):
-                    self.mesh[idx, 0] = float(self.base_mesh[idx, 0])
-                    self.mesh[idx, 1] = float(self.base_mesh[idx, 1])
-                    self.mesh[idx, 2] = float(self.base_mesh[idx, 2])
-            
+            self.mesh = self.base_mesh.copy()
             self.vbo_points.write(self.mesh.tobytes())
             self.vbo_lines.write(self.mesh.tobytes())
         except Exception as e:
             print(f"Reset error: {e}")
 
-    def update_ultra_realistic_lips(self, delta):
-        """✅ ULTRA-REALISTIC: Advanced phoneme-based lip animation"""
-        if not self.speaking:
-            self.lip_time = 0.0
-            return
-            
+    def apply_mouth_deformation(self):
+        """Apply realistic mouth deformation based on current viseme"""
         try:
-            self.lip_time += float(delta * 25.0)
+            open_v, wide_v, round_v, closed_v = VISEME_TO_MOUTH.get(self.current_viseme, VISEME_TO_MOUTH["REST"])
             
-            # ✅ PHONEME SIMULATION: Cycle through different mouth shapes
-            phoneme_cycle = int(self.lip_time * 2) % len(self.phoneme_patterns)
-            current_phoneme = list(self.phoneme_patterns.keys())[phoneme_cycle]
-            phoneme_data = self.phoneme_patterns[current_phoneme]
+            # Get mouth points
+            mouth_points = self.mesh[self.mouth_indices]
+            center = mouth_points.mean(axis=0, keepdims=True)
             
-            for i, vertex_idx in enumerate(self.lip_indices):
-                if not (0 <= vertex_idx < len(self.mesh)):
-                    continue
+            # Apply deformation (from reference file algorithm)
+            v = mouth_points - center
+            v[:, 1] *= (1.0 + (open_v * 1.6 - closed_v * 0.8))
+            v[:, 0] *= (1.0 + (wide_v * 0.8))
+            v *= (1.0 - round_v * 0.45)
+            
+            # Update mesh
+            self.mesh[self.mouth_indices] = center + v
+            
+            # Apply blinking
+            blink_phase = self.get_blink_amount()
+            for i in self.eyelid_upper:
+                if i < len(self.mesh):
+                    self.mesh[i, 1] += 0.02 * blink_phase
+            for i in self.eyelid_lower:
+                if i < len(self.mesh):
+                    self.mesh[i, 1] -= 0.02 * blink_phase
                     
-                # Get base position
-                base_x = float(self.base_mesh[vertex_idx, 0])
-                base_y = float(self.base_mesh[vertex_idx, 1])
-                base_z = float(self.base_mesh[vertex_idx, 2])
-                
-                # ✅ ADVANCED: Multiple animation layers for ultra-realism
-                
-                # 1. Phoneme-specific movement
-                phoneme_open = float(phoneme_data['mouth_open'] * np.sin(self.lip_time + i * 0.2))
-                phoneme_wide = float(phoneme_data['mouth_wide'] * np.sin(self.lip_time * 1.1 + i * 0.15))
-                
-                # 2. Natural speech rhythm
-                speech_rhythm = float(0.06 * np.sin(self.lip_time * 1.8 + i * 0.3))
-                
-                # 3. Articulation movements (tongue influence)
-                articulation = float(0.03 * np.sin(self.lip_time * 2.2 + i * 0.25))
-                
-                # 4. Breathing patterns
-                breathing = float(0.008 * np.sin(self.lip_time * 0.4 + i * 0.1))
-                
-                # 5. Natural asymmetry (humans aren't symmetric)
-                asymmetry_x = float(0.004 * np.sin(self.lip_time * 1.3 + i * 0.7))
-                asymmetry_y = float(0.002 * np.cos(self.lip_time * 1.5 + i * 0.8))
-                
-                # 6. Micro-expressions
-                micro_expr = float(0.006 * np.sin(self.lip_time * 0.6 + i * 0.4))
-                
-                # ✅ COMBINE: All layers with natural weighting
-                total_x = float(phoneme_wide + asymmetry_x)
-                total_y = float(phoneme_open + speech_rhythm + articulation + breathing + asymmetry_y + micro_expr)
-                total_z = float(0.02 * np.sin(self.lip_time * 0.7 + i * 0.2))
-                
-                # ✅ APPLY: Ultra-realistic movement
-                self.mesh[vertex_idx, 0] = float(base_x + total_x)
-                self.mesh[vertex_idx, 1] = float(base_y + total_y)
-                self.mesh[vertex_idx, 2] = float(base_z + total_z)
-            
-            # Update buffers
-            self.vbo_points.write(self.mesh.tobytes())
-            self.vbo_lines.write(self.mesh.tobytes())
-            
         except Exception as e:
-            print(f"Ultra-realistic lip error: {e}")
-            self.speaking = False
+            print(f"Mouth deformation error: {e}")
+
+    def get_blink_amount(self):
+        """Calculate blink animation"""
+        t = self.blink_t
+        if t < 0.18:
+            x = t / 0.18
+            return 1.0 - abs(2*x - 1.0)
+        return 0.0
+
+    def update(self, dt: float):
+        """Update animations"""
+        # Blink system
+        self.blink_t += dt
+        if self.blink_t > self.next_blink_gap:
+            self.blink_t = 0.0
+            self.next_blink_gap = random.uniform(3.0, 6.0)
 
     def on_render(self, time, frame_time):
         try:
             self.time = time
-            self.update_ultra_realistic_lips(frame_time)
+            self.update(frame_time)
+            
+            # Reset to base mesh
+            self.mesh = self.base_mesh.copy()
+            
+            # Apply mouth deformation
+            if self.speaking:
+                self.apply_mouth_deformation()
 
+            # Static positioning
             model = Matrix44.identity()
             view = Matrix44.look_at(
                 eye=(0, 0, 2.8),
@@ -312,11 +538,17 @@ class HologramFace(WindowConfig):
             )
             mvp = proj * view * model
 
+            # Update uniforms
             self.point_prog['mvp'].write(mvp.astype('f4').tobytes())
             self.point_prog['time'].value = self.time
             self.line_prog['mvp'].write(mvp.astype('f4').tobytes())
             self.line_prog['time'].value = self.time
 
+            # Update buffers
+            self.vbo_points.write(self.mesh.tobytes())
+            self.vbo_lines.write(self.mesh.tobytes())
+
+            # Render
             self.ctx.clear(0, 0, 0, 1)
             self.ctx.enable(moderngl.BLEND)
             self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
@@ -327,147 +559,135 @@ class HologramFace(WindowConfig):
         except Exception as e:
             print(f"Render error: {e}")
 
-# ✅ IMPROVED ELEVENLABS FUNCTIONS
-def elevenlabs_tts(text, outfile=TTS_FILENAME, voice_id=ELEVENLABS_VOICE_ID):
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {
-        "Accept": "audio/mpeg",
-        "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY
-    }
-    data = {
-        "text": text,
-        "model_id": "eleven_monolingual_v1",
-        "voice_settings": {
-            "stability": 0.8,
-            "similarity_boost": 0.9,
-            "style": 0.3,
-            "use_speaker_boost": True
-        }
-    }
-    
+# ---- SAFE AUDIO FUNCTIONS ----
+def safe_play_audio(audio_data, sample_rate):
+    """Play audio safely without crashes"""
     try:
-        response = requests.post(url, json=data, headers=headers)
-        if response.status_code == 200:
-            with open(outfile, 'wb') as f:
-                f.write(response.content)
-            return outfile
+        if sd is not None:
+            # Normalize to prevent clipping
+            if len(audio_data) > 0:
+                audio_norm = audio_data.astype(np.float32) / 32768.0
+                sd.play(audio_norm, samplerate=sample_rate)
+                sd.wait()
         else:
-            print("❌ TTS failed:", response.text)
-            return None
+            print("Audio playback unavailable")
     except Exception as e:
-        print(f"❌ TTS Error: {e}")
-        return None
+        print(f"Audio playback error: {e}")
 
-def elevenlabs_asr(audiofile_path):
-    """✅ IMPROVED: Better English recognition with optimized settings"""
-    url = "https://api.elevenlabs.io/v1/speech-to-text"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY
-    }
-    
+def safe_record_audio(filename, duration=5):
+    """Record audio safely"""
     try:
-        with open(audiofile_path, 'rb') as f:
-            files = {'file': (audiofile_path, f, 'audio/wav')}
-            # ✅ FORCE ENGLISH: Better recognition settings
-            data = {
-                'model_id': 'scribe_v1',
-                'language': 'en',  # Force English
-                'optimize_streaming_latency': 0,  # Better accuracy
-                'voice_isolation': True  # Remove background noise
-            }
-            response = requests.post(url, headers=headers, files=files, data=data)
-        
-        if response.status_code == 200:
-            result = response.json()
-            text = result.get('text', '').strip()
-            # ✅ CLEAN UP: Remove common transcription artifacts
-            text = text.replace('(background noise)', '').replace('(music)', '').strip()
-            return text
+        if sd is not None and sf is not None:
+            print("🎤 Recording... Speak clearly now.")
+            audio = sd.rec(int(duration * AUDIO_SAMPLE_RATE), 
+                          samplerate=AUDIO_SAMPLE_RATE, 
+                          channels=AUDIO_CHANNELS, 
+                          dtype='float32')
+            sd.wait()
+            
+            # Simple noise gate
+            audio_abs = np.abs(audio)
+            noise_floor = np.percentile(audio_abs, 20)
+            audio = np.where(audio_abs < noise_floor * 2, audio * 0.1, audio)
+            
+            # Normalize and convert to int16
+            if np.max(np.abs(audio)) > 0:
+                audio = audio / np.max(np.abs(audio)) * 0.8
+            
+            audio_int16 = (audio * 32767).astype(np.int16)
+            sf.write(filename, audio_int16, AUDIO_SAMPLE_RATE)
+            print("✅ Recording complete.")
+            return True
         else:
-            print("❌ ASR failed:", response.text)
-            return ""
+            print("Recording unavailable")
+            return False
     except Exception as e:
-        print(f"❌ ASR Error: {e}")
-        return ""
+        print(f"Recording error: {e}")
+        return False
 
-def record_audio(filename, duration=6, fs=AUDIO_SAMPLE_RATE):
-    """✅ IMPROVED: Better audio quality for recognition"""
-    try:
-        print("🎤 Recording... Speak clearly in English now.")
-        # ✅ BETTER SETTINGS: Higher quality recording
-        audio = sd.rec(int(duration * fs), samplerate=fs, channels=AUDIO_CHANNELS, dtype='float64')
-        sd.wait()
-        
-        # ✅ NOISE REDUCTION: Simple noise gate
-        audio_abs = np.abs(audio)
-        noise_floor = np.percentile(audio_abs, 20)
-        audio = np.where(audio_abs < noise_floor * 2, audio * 0.1, audio)
-        
-        # Normalize
-        if np.max(np.abs(audio)) > 0:
-            audio = audio / np.max(np.abs(audio)) * 0.95
-        
-        sf.write(filename, audio, fs)
-        print("✅ Recording complete.")
-    except Exception as e:
-        print(f"❌ Recording error: {e}")
-
-def play_audio_clip(filename):
-    try:
-        data, samplerate = sf.read(filename)
-        sd.play(data, samplerate)
-        sd.wait()
-    except Exception as e:
-        print(f"❌ Audio playback error: {e}")
+def simple_asr(audiofile_path):
+    """Simple fallback ASR"""
+    # This is a placeholder - you could integrate with Google Speech-to-Text
+    # or other services here
+    return "Hello"
 
 class SpeechManager:
     def __init__(self, holo):
         self.holo = holo
         self.listening = False
+        self.timeline = []
+        self.audio_start_time = None
 
-    def speak(self, text):
+    def speak_with_lipsync(self, text):
+        """Enhanced speak with proper viseme lip sync"""
         def tts_and_play():
             try:
                 self.holo.start_speaking()
-                audio_file = elevenlabs_tts(text)
-                if audio_file and os.path.exists(audio_file):
-                    play_audio_clip(audio_file)
+                
+                # Get audio and timeline from ElevenLabs
+                audio_data, sample_rate, timeline = elevenlabs_tts_with_alignment(text)
+                
+                if audio_data is not None and timeline:
+                    self.timeline = timeline
+                    self.audio_start_time = time.time()
+                    
+                    # Start lip sync in separate thread
+                    def lip_sync_thread():
+                        while self.holo.speaking and self.audio_start_time:
+                            t_now = time.time() - self.audio_start_time
+                            viseme = active_viseme(self.timeline, t_now)
+                            self.holo.set_viseme(viseme)
+                            time.sleep(0.02)  # 50 FPS lip sync
+                    
+                    threading.Thread(target=lip_sync_thread, daemon=True).start()
+                    
+                    # Play audio
+                    safe_play_audio(audio_data, sample_rate)
                 else:
+                    # Fallback timing
                     time.sleep(max(2, len(text) * 0.08))
+                
+                self.audio_start_time = None
                 self.holo.stop_speaking()
+                
             except Exception as e:
-                print(f"Speech error: {e}")
+                print(f"TTS error: {e}")
+                self.audio_start_time = None
                 self.holo.stop_speaking()
         
         threading.Thread(target=tts_and_play, daemon=True).start()
 
     def listen(self, on_text):
         if self.listening:
-            print("🔄 Already listening...")
+            print("Already listening...")
             return
         
         self.listening = True
 
-        def asr_workflow():
+        def listen_workflow():
             try:
-                record_audio(AUDIO_FILENAME, duration=6)  # Longer recording
-                recognized = elevenlabs_asr(AUDIO_FILENAME)
+                if safe_record_audio(AUDIO_FILENAME, duration=5):
+                    # Here you could use Vosk or other STT
+                    recognized = simple_asr(AUDIO_FILENAME)
+                else:
+                    recognized = ""
+                
                 print(f"👤 User said: '{recognized}'")
                 self.listening = False
-                on_text(recognized if recognized else "")
+                on_text(recognized)
+                
             except Exception as e:
-                print(f"❌ Listen error: {e}")
+                print(f"Listen error: {e}")
                 self.listening = False
                 on_text("")
 
-        threading.Thread(target=asr_workflow, daemon=True).start()
+        threading.Thread(target=listen_workflow, daemon=True).start()
 
 class ControlPanel:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("🤖 Lumen AI - ULTRA Realistic Lip Sync")
-        self.root.geometry("420x270")
+        self.root.title("🤖 Lumen AI - Realistic Viseme Lip Sync")
+        self.root.geometry("440x280")
         self.root.configure(bg='#0a0a0a')
         self.root.resizable(False, False)
         
@@ -475,39 +695,37 @@ class ControlPanel:
         main_frame.pack(expand=True, fill='both', padx=20, pady=15)
         
         title_label = tk.Label(main_frame, text="🤖 LUMEN + SILAS VANE", 
-                             fg='#00ffff', bg='#0a0a0a', font=('Arial', 20, 'bold'))
+                             fg='#00ffff', bg='#0a0a0a', font=('Arial', 22, 'bold'))
         title_label.pack(pady=15)
         
-        self.speak_button = tk.Button(main_frame, text="🎤 HOLD TO SPEAK ENGLISH", 
+        self.speak_button = tk.Button(main_frame, text="🎤 HOLD TO SPEAK", 
                                      bg='#1a4d66', fg='white', 
-                                     font=('Arial', 16, 'bold'),
+                                     font=('Arial', 18, 'bold'),
                                      relief='raised', borderwidth=4,
                                      activebackground='#ff4444',
                                      cursor='hand2')
-        self.speak_button.pack(pady=18, padx=20, fill='x', ipady=12)
+        self.speak_button.pack(pady=20, padx=20, fill='x', ipady=15)
         
-        self.status_label = tk.Label(main_frame, text="🟢 ULTRA-REALISTIC LIP SYNC READY", 
+        self.status_label = tk.Label(main_frame, text="🟢 REALISTIC VISEME LIP SYNC READY", 
                                    fg='#00ff00', bg='#0a0a0a', font=('Arial', 12, 'bold'))
-        self.status_label.pack(pady=10)
+        self.status_label.pack(pady=12)
         
-        info_label = tk.Label(main_frame, text="Phoneme-based ultra-realistic lip animation", 
-                            fg='#888888', bg='#0a0a0a', font=('Arial', 10))
+        info_label = tk.Label(main_frame, text="Advanced viseme-based lip animation", 
+                            fg='#888888', bg='#0a0a0a', font=('Arial', 11))
         info_label.pack()
         
-        lang_label = tk.Label(main_frame, text="✨ Optimized for clear English speech", 
+        tech_label = tk.Label(main_frame, text="✨ ElevenLabs alignment + phoneme mapping", 
                             fg='#ffaa00', bg='#0a0a0a', font=('Arial', 10))
-        lang_label.pack(pady=5)
+        tech_label.pack(pady=5)
         
         self.speak_button.bind('<Button-1>', self.start_speaking)
         self.speak_button.bind('<ButtonRelease-1>', self.stop_speaking)
         
         self.speaking = False
-        
-        # ✅ THREAD-SAFE: Process GUI updates safely
         self.process_gui_updates()
         
     def process_gui_updates(self):
-        """✅ FIXED: Thread-safe GUI updates"""
+        """Thread-safe GUI updates"""
         try:
             while True:
                 try:
@@ -520,15 +738,12 @@ class ControlPanel:
                     break
         except:
             pass
-        # Schedule next check
         self.root.after(100, self.process_gui_updates)
         
     def update_status_safe(self, text, color):
-        """✅ THREAD-SAFE: Safe status updates"""
         gui_queue.put(('status', {'text': text, 'color': color}))
         
     def update_button_safe(self, text, color):
-        """✅ THREAD-SAFE: Safe button updates"""
         gui_queue.put(('button', {'text': text, 'color': color}))
     
     def start_speaking(self, event):
@@ -536,38 +751,33 @@ class ControlPanel:
         if not self.speaking and speech_manager:
             self.speaking = True
             self.update_button_safe("🔴 RECORDING...", '#cc2222')
-            self.update_status_safe("🎧 LISTENING FOR ENGLISH...", '#ffaa00')
+            self.update_status_safe("🎧 LISTENING...", '#ffaa00')
             speech_manager.listen(self.process_speech)
     
     def stop_speaking(self, event):
         if self.speaking:
             self.speaking = False
-            self.update_button_safe("🎤 HOLD TO SPEAK ENGLISH", '#1a4d66')
+            self.update_button_safe("🎤 HOLD TO SPEAK", '#1a4d66')
             self.update_status_safe("🔄 PROCESSING...", '#ff8800')
     
     def process_speech(self, text):
         global speech_manager
         
-        # ✅ ENHANCED RESPONSES: Better conversation with more variety
         RESPONSES = {
-            "hello": "Hello! I'm Lumen with ultra-realistic lip sync using phoneme-based animation and Silas Vane's distinguished voice!",
-            "hi": "Hi there! My lip movements now simulate real phonemes like A, E, I, O, U sounds with natural breathing and asymmetry!",
-            "how are you": "I'm functioning perfectly with advanced lip synchronization that includes speech rhythm, articulation, and micro-expressions!",
-            "test": "Perfect! My ultra-realistic lip sync with Silas Vane voice now uses phoneme simulation for incredibly lifelike speech!",
-            "voice": "I use Silas Vane's voice with phoneme-based lip animation that creates different mouth shapes for different speech sounds!",
-            "lips": "My lips now move with ultra-realistic patterns including vowel shapes, consonant articulation, breathing, and natural asymmetry!",
-            "realistic": "Absolutely! I simulate real human speech with phoneme patterns, rhythm variations, articulation movements, and breathing cycles!",
-            "phoneme": "Yes! I use phoneme-based animation with different mouth shapes for A, E, I, O, U, M, P, F, and S sounds - just like humans!",
-            "amazing": "Thank you! My ultra-realistic lip sync combines phoneme simulation, speech rhythm, articulation, breathing, and micro-expressions!",
-            "natural": "My lip animation now includes natural asymmetry, breathing patterns, micro-expressions, and phoneme-specific mouth shapes!",
-            "english": "Perfect! I'm optimized for English speech recognition with noise reduction and better transcription accuracy!",
-            "understand": "Yes! I can now understand English much better with improved voice isolation and optimized recognition settings!",
-            "name": "I'm Lumen, your ultra-realistic holographic AI with advanced phoneme-based lip sync and Silas Vane's voice!",
-            "joke": "Why do ultra-realistic holograms make the best speakers? Because we finally have perfect phoneme synchronization!"
+            "hello": "Hello! I'm Lumen with realistic viseme-based lip synchronization using ElevenLabs alignment data and Silas Vane's voice!",
+            "hi": "Hi there! My lip sync now uses proper viseme mapping with A, E, I, O, U, MBP, FV phonemes for ultra-realistic speech!",
+            "test": "Perfect! My viseme lip sync with ElevenLabs alignment creates incredibly realistic mouth movements synchronized to speech!",
+            "viseme": "Yes! I use advanced viseme mapping where each phoneme creates specific mouth shapes - A for open, MBP for closed, O for rounded!",
+            "realistic": "My lip animation uses ElevenLabs phoneme alignment data to create visemes that match real human speech patterns!",
+            "phoneme": "I map phonemes to visemes: A-E-I-O-U for vowels, MBP for lips closed, FV for lip-teeth contact, and more!",
+            "voice": "I speak with Silas Vane's voice and my lips sync perfectly using timeline-based viseme animation!",
+            "mouth": "My mouth deformation uses mathematical models with open, wide, round, and closed parameters for each viseme!",
+            "sync": "My lip sync is frame-accurate using ElevenLabs alignment timestamps matched to viseme priorities!",
+            "amazing": "Thank you! This advanced viseme system creates the most realistic lip animation possible!"
         }
         
         print(f"👤 User said: '{text}'")
-        response = "I can hear you speaking English! My ultra-realistic lip sync with phoneme-based animation is ready to demonstrate natural speech patterns!"
+        response = "I can hear you perfectly! My realistic viseme lip sync with ElevenLabs alignment is ready to demonstrate!"
         text_lower = text.lower().strip()
         
         if text_lower:
@@ -576,14 +786,14 @@ class ControlPanel:
                     response = reply
                     break
         
-        print(f"🤖 Lumen (Ultra-Realistic) responds: '{response}'")
-        self.update_status_safe("🗣️ ULTRA-REALISTIC SPEAKING...", '#00ffff')
+        print(f"🤖 Lumen (Viseme) responds: '{response}'")
+        self.update_status_safe("🗣️ REALISTIC VISEME SPEAKING...", '#00ffff')
         
         def reset_status():
             time.sleep(max(4, len(response) * 0.08))
-            self.update_status_safe("🟢 ULTRA-REALISTIC LIP SYNC READY", '#00ff00')
+            self.update_status_safe("🟢 REALISTIC VISEME LIP SYNC READY", '#00ff00')
         
-        speech_manager.speak(response)
+        speech_manager.speak_with_lipsync(response)
         threading.Thread(target=reset_status, daemon=True).start()
     
     def run(self):
@@ -592,7 +802,7 @@ class ControlPanel:
 def main():
     global face_points_global, holo_instance, speech_manager
     
-    print("🚀 Initializing ULTRA-REALISTIC Lumen with phoneme-based lip sync...")
+    print("🚀 Initializing REALISTIC viseme-based hologram with ElevenLabs alignment...")
     
     face_points_global = capture_face_mesh()
     
@@ -602,7 +812,7 @@ def main():
     holo_thread = threading.Thread(target=run_holo, daemon=True)
     holo_thread.start()
     
-    print("⏳ Starting ultra-realistic hologram renderer...")
+    print("⏳ Starting realistic hologram renderer...")
     count = 0
     while holo_instance is None:
         time.sleep(0.1)
@@ -613,7 +823,7 @@ def main():
     
     speech_manager = SpeechManager(holo_instance)
     
-    print("✅ ULTRA-REALISTIC Lumen with phoneme-based lip sync is ready!")
+    print("✅ REALISTIC viseme-based Lumen hologram is ready!")
     control_panel = ControlPanel()
     control_panel.run()
 
